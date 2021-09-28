@@ -49,10 +49,10 @@ class Servidor:
                 self.callback(conexao)
                 
         elif (flags & FLAGS_FIN) == FLAGS_FIN:
-            data = b''
+            dados= b''
             self.conexoes[id_conexao].nseq_cl = self.conexoes[id_conexao].nseq_cl + 1
             seq_no = seq_no + 1
-            self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, data)
+            self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, dados)
             self.conexoes.pop(id_conexao)
                 
         elif id_conexao in self.conexoes:
@@ -116,9 +116,9 @@ class Conexao:
     def enviar(self, dados):
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
         
-        while(len(data)):
-            payload = data[:MSS]
-            data = data[MSS:len(data)]
+        while(len(dados)):
+            payload = dados[:MSS]
+            dados = dados[MSS:len(dados)]
             pac = make_header(dst_port, src_port, self.nseq_serv, self.nseq_cl, FLAGS_ACK)
             pac_fix = fix_checksum(pac + payload, dst_addr, src_addr)
             self.servidor.rede.enviar(pac_fix, src_addr)
