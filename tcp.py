@@ -1,7 +1,5 @@
-import asyncio
+import asyncio, random
 from tcputils import *
-from random import randint
-size = 0xffff
 
 class Servidor:
     def __init__(self, rede, porta):
@@ -12,10 +10,6 @@ class Servidor:
         self.rede.registrar_recebedor(self._rdt_rcv)
 
     def registrar_monitor_de_conexoes_aceitas(self, callback):
-        """
-        Usado pela camada de aplicação para registrar uma função para ser chamada
-        sempre que uma nova conexão for aceita
-        """
         self.callback = callback
 
     def _rdt_rcv(self, src_addr, dst_addr, segment):
@@ -33,29 +27,19 @@ class Servidor:
         id_conexao = (src_addr, src_port, dst_addr, dst_port)
 
         if (flags & FLAGS_SYN) == FLAGS_SYN:
-            # A flag SYN estar setada significa que é um cliente tentando estabelecer uma conexão nova
-            # TODO: talvez você precise passar mais coisas para o construtor de conexão
-            conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao)
-            nseq_serv = randint(0, 0xffff)
+            init_n = random.randint(1, 10000000)
+            ack_no = seq_no + 1
+            flags = FLAGS_ACK|FLAGS_SYN
             
-            conexao.nseq_cl = seq_no + 1
-            conexao.nseq_serv = nseq_serv + 1
-            conexao.sendb = conexao.nseq_serv
-            
-            pac = make_header(dst_port, src_port, nseq_serv, conexao.nseq_cl, FLAGS_SYN + FLAGS_ACK)
-            pac_fix = fix_checksum(pac, dst_addr, src_addr)
-            self.rede.enviar(pac_fix, src_addr)
+            pac = make_header(self.porta, src_port, init_n, ack_no, flags)
+            pac = fix_checksum(pac, src_addr, dst_addr)
+            self.rede.enviar(pac, src_addr)            
 
+            conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, init_n, ack_no)
+            # TODO: você precisa fazer o handshake aceitando a conexão. Escolha se você acha melhor
+            # fazer aqui mesmo ou dentro da classe Conexao.
             if self.callback:
                 self.callback(conexao)
-                
-        elif (flags & FLAGS_FIN) == FLAGS_FIN:
-            dados= b''
-            self.conexoes[id_conexao].nseq_cl = self.conexoes[id_conexao].nseq_cl + 1
-            seq_no = seq_no + 1
-            self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, dados)
-            self.conexoes.pop(id_conexao)
-                
         elif id_conexao in self.conexoes:
             # Passa para a conexão adequada se ela já estiver estabelecida
             self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, payload)
@@ -65,45 +49,49 @@ class Servidor:
 
 
 class Conexao:
-    def __init__(self, servidor, id_conexao):
+    def __init__(self, servidor, id_conexao, seq_no, n_seq):
         self.servidor = servidor
         self.id_conexao = id_conexao
+        self.seq_no = seq_no + 1
+        self.n_seq = n_seq
         self.callback = None
-        self.nseq_cl = None
-        self.nseq_serv = None
-        self.timer = None 
+        self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
         #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
-        self.fila = []
-        self.sendb = None      
-        
-    def timeout(self):
-        if len(self.fila) > -1:
-            pac_fix, src_addr = self.fila[0]
-            self.servidor.rede.enviar(pac_fix, src_addr)
+        self.ini = seq_no
+        self.buff1 = b''
+        self.buff2 = b''
+        self.t = True
+        self.f = False
+
+    def _exemplo_timer(self):
+        # Esta função é só um exemplo e pode ser removida
+        print('Este é um exemplo de como fazer um timer')
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
-            if seq_no == self.nseq_cl:
-              self.callback(self, payload)
-              if (flags & FLAGS_ACK) == FLAGS_ACK and ack_no > self.sendb:
-                self.sendb = ack_no           
-                if len(self.fila) > -1:
-                    self.fila.pop(0)
-                    self.timer.cancel()
-                    if len(self.fila) > -1:
-                        self.timer = asyncio.get_event_loop().call_later(0.5, self.timeout)
-              if (flags & FLAGS_FIN) == FLAGS_FIN:
-                payload = b''
-                
-            elif len(payload) < 1:
-                return
-            
-            self.nseq_cl = self.nseq_cl + len(payload)
-            src_addr, src_port, dst_addr, dst_port = self.id_conexao
-            pac = make_header(dst_port, src_port, self.sendb, self.nseq_cl, FLAGS_ACK)
-            pac_fix = fix_checksum(pac, dst_addr, src_addr)
-            self.servidor.rede.enviar(pac_fix, src_addr)
-           
-            print('recebido payload: %r' % payload)
+        # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
+        # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
+        # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
+        print('recebido payload: %r' % payload)
+        
+        if seq_no == self.n_seq and payload:
+            self.n_seq = seq_no + len(payload)
+            self.callback(self, payload)
+            pac = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, self.n_seq, flags)
+            pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
+            self.servidor.rede.enviar(pac, self.id_conexao[0])
+
+        elif not self.f:
+            if (flags & FLAGS_FIN) == FLAGS_FIN:
+                self.callback(self, b'')
+                self.n_seq = self.n_seq + 1
+                pac = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, self.n_seq, FLAGS_ACK)
+                pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
+                self.servidor.rede.enviar(pac, self.id_conexao[0])
+                self.f = True
+
+        elif self.f:
+            if flags & FLAGS_ACK == FLAGS_ACK:
+                del self.servidor.conexoes[self.id_conexao]
 
     # Os métodos abaixo fazem parte da API
 
@@ -115,20 +103,23 @@ class Conexao:
         self.callback = callback
 
     def enviar(self, dados):
-        src_addr, src_port, dst_addr, dst_port = self.id_conexao
-        
-        while(len(dados)):
-            payload = dados[:MSS]
-            dados = dados[MSS:len(dados)]
-            pac = make_header(dst_port, src_port, self.nseq_serv, self.nseq_cl, FLAGS_ACK)
-            pac_fix = fix_checksum(pac + payload, dst_addr, src_addr)
-            self.servidor.rede.enviar(pac_fix, src_addr)
-            self.nseq_serv = self.nseq_serv + len(payload)
-            self.timer = asyncio.get_event_loop().call_later(0.5, self.timeout)
-            self.fila.append((pac_fix, src_addr))
+        if len(dados)>MSS:
+            while len(dados)>MSS:
+                data0 = dados[:MSS]
+                data1 = dados[MSS:]
+                dados = data1
+                self.seq_no = self.seq_no + len(data0)
+                pac = make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.n_seq, FLAGS_ACK)
+                pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
+                self.servidor.rede.enviar(pac + data0, self.id_conexao[0])
+            self.seq_no = self.seq_no + len(dados)
+
+        pac = make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.n_seq, FLAGS_ACK)
+        pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
+        self.servidor.rede.enviar(pac+dados, self.id_conexao[0])
+
 
     def fechar(self):
-        src_addr, src_port, dst_addr, dst_port = self.id_conexao
-        pac = make_header(dst_port, src_port, self.nseq_serv, self.nseq_cl, FLAGS_FIN)
-        pac_fix = fix_checksum(pac, dst_addr, src_addr)
-        self.servidor.rede.enviar(pac_fix, src_addr)
+        pac = make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.n_seq, FLAGS_FIN)
+        pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
+        self.servidor.rede.enviar(pac, self.id_conexao[0])
