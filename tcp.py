@@ -1,6 +1,7 @@
 import asyncio
 from tcputils import *
 from random import randint
+size = 0xffff
 
 class Servidor:
     def __init__(self, rede, porta):
