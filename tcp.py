@@ -186,7 +186,7 @@ class Conexao:
                 segment = pront[i * MSS : (i + 1) * MSS]
                 self.enviar_seg_ack(segment)
                          
-    def calc_rt(self):
+    def calcula_rtt(self):
         self.sample_rtt = self.temp_fin - self.temp_ini
         if self.iter_inic:
             self.iter_inic = False
