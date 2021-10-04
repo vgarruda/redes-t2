@@ -123,7 +123,7 @@ class Conexao:
         if self.byt_ack == MSS:
             self.byt_ack = self.byt_ack + MSS
             self.window = self.window + 1
-            self.enviar_pendencia()
+            self.envio_pendente()
         if payload:
             self.ack_no = self.ack_no + len(payload)
             self.callback(self, payload)
