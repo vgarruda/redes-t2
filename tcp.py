@@ -1,5 +1,8 @@
-import asyncio, random
+import asyncio
 from tcputils import *
+import time
+import math
+import secrets
 
 class Servidor:
     def __init__(self, rede, porta):
@@ -10,6 +13,10 @@ class Servidor:
         self.rede.registrar_recebedor(self._rdt_rcv)
 
     def registrar_monitor_de_conexoes_aceitas(self, callback):
+        """
+        Usado pela camada de aplicação para registrar uma função para ser chamada
+        sempre que uma nova conexão for aceita
+        """
         self.callback = callback
 
     def _rdt_rcv(self, src_addr, dst_addr, segment):
@@ -27,71 +34,101 @@ class Servidor:
         id_conexao = (src_addr, src_port, dst_addr, dst_port)
 
         if (flags & FLAGS_SYN) == FLAGS_SYN:
-            init_n = random.randint(1, 10000000)
-            ack_no = seq_no + 1
-            flags = FLAGS_ACK|FLAGS_SYN
-            
-            pac = make_header(self.porta, src_port, init_n, ack_no, flags)
-            pac = fix_checksum(pac, src_addr, dst_addr)
-            self.rede.enviar(pac, src_addr)            
-
-            conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, init_n, ack_no)
-            # TODO: você precisa fazer o handshake aceitando a conexão. Escolha se você acha melhor
-            # fazer aqui mesmo ou dentro da classe Conexao.
+            conexao = self.conexoes[id_conexao] = self.inic_conexao(id_conexao, segment)
             if self.callback:
                 self.callback(conexao)
+                
         elif id_conexao in self.conexoes:
             # Passa para a conexão adequada se ela já estiver estabelecida
             self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, payload)
         else:
             print('%s:%d -> %s:%d (pacote associado a conexão desconhecida)' %
                   (src_addr, src_port, dst_addr, dst_port))
-
+            
+    def inic_conexao(self, id_conexao, segment):
+    	_, _, seq_no, _, flags, _, _, _ = read_header(segment)
+    	src_addr, src_port, dst_addr, dst_port = id_conexao
+    	ack_no = seq_no + 1
+    	seq_no = secrets.randbelow(10)
+    	seg_ack = make_header(dst_port, src_port, seq_no, ack_no, FLAGS_ACK | FLAGS_SYN)
+    	seg_ack = fix_checksum(seg_ack, src_addr, dst_addr)
+    	self.rede.enviar(seg_ack, src_addr)
+    	return Conexao(self, id_conexao, ack_no, seq_no + 1)    
 
 class Conexao:
-    def __init__(self, servidor, id_conexao, seq_no, n_seq):
+    def __init__(self, servidor, id_conexao, ack_no, seq_no):
         self.servidor = servidor
         self.id_conexao = id_conexao
-        self.seq_no = seq_no + 1
-        self.n_seq = n_seq
         self.callback = None
-        self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
-        #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
-        self.ini = seq_no
-        self.buff1 = b''
-        self.buff2 = b''
-        self.t = True
-        self.f = False
+        self.temp_ini = None
+        self.temp_fin = None
+        self.timer = None
+        self.devr = None  
+        self.ack_no = ack_no
+        self.seq_no = seq_no
+        self.sendb = seq_no
+        self.ult_seq = seq_no
+        self.unacked = b""
+        self.unsent = b""
+        self.byt_ack = 0
+        self.interv = 0.8
+        self.iter_inic = True
+        self.window = 1
+        self.closing = False
+        self.retransm = False
+        
+    def timer_limit(self):
+        self.timer = None
+        self.window = max(self.window // 2, 1)
+        self.retransmitir()
+        self.timer_inic()
 
-    def _exemplo_timer(self):
-        # Esta função é só um exemplo e pode ser removida
-        print('Este é um exemplo de como fazer um timer')
+    def timer_inic(self):
+        if self.timer:
+            self.timer_para()
+        self.timer = asyncio.get_event_loop().call_later(self.interv, self.timer_limit)
+        
+    def timer_para(self):
+        self.timer.cancel()
+        self.timer = None
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
-        # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
-        # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
-        # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
-        print('recebido payload: %r' % payload)
-        
-        if seq_no == self.n_seq and payload:
-            self.n_seq = seq_no + len(payload)
+        if self.ack_no != seq_no:
+            return
+        if (flags & FLAGS_FIN) == FLAGS_FIN and not self.closing:
+            self.closing = True 
+            self.callback(self, b"")
+            self.ack_no = self.ack_no + 1
+            self.enviar_seg_ack(b"") 
+        elif (flags & FLAGS_ACK) == FLAGS_ACK and self.closing:
+            del self.servidor.conexoes[self.id_conexao]
+            return
+
+        if(flags & FLAGS_ACK) == FLAGS_ACK and ack_no > self.sendb :
+            self.unacked = self.unacked[ack_no - self.sendb :]
+            self.byt_ack = ack_no - self.sendb
+            self.sendb = ack_no
+            if self.unacked:
+                self.timer_inic()
+            else:
+                if self.timer:
+                    self.timer_para()
+                if not self.retransm:
+                    self.temp_fin = time.time()
+                    
+                    self.calcula_rtt()   
+                else:
+                    self.retransm = False
+
+        if self.byt_ack == MSS:
+            self.byt_ack = self.byt_ack + MSS
+            self.window = self.window + 1
+            self.enviar_pendencia()
+        if payload:
+            self.ack_no = self.ack_no + len(payload)
             self.callback(self, payload)
-            pac = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, self.n_seq, flags)
-            pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
-            self.servidor.rede.enviar(pac, self.id_conexao[0])
-
-        elif not self.f:
-            if (flags & FLAGS_FIN) == FLAGS_FIN:
-                self.callback(self, b'')
-                self.n_seq = self.n_seq + 1
-                pac = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, self.n_seq, FLAGS_ACK)
-                pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
-                self.servidor.rede.enviar(pac, self.id_conexao[0])
-                self.f = True
-
-        elif self.f:
-            if flags & FLAGS_ACK == FLAGS_ACK:
-                del self.servidor.conexoes[self.id_conexao]
+            pac = fix_checksum(make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.ack_no, flags), self.id_conexao[0], self.id_conexao[2],)
+            self.servidor.rede.enviar(pac, self.id_conexao[2])
 
     # Os métodos abaixo fazem parte da API
 
@@ -103,23 +140,59 @@ class Conexao:
         self.callback = callback
 
     def enviar(self, dados):
-        if len(dados)>MSS:
-            while len(dados)>MSS:
-                data0 = dados[:MSS]
-                data1 = dados[MSS:]
-                dados = data1
-                self.seq_no = self.seq_no + len(data0)
-                pac = make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.n_seq, FLAGS_ACK)
-                pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
-                self.servidor.rede.enviar(pac + data0, self.id_conexao[0])
-            self.seq_no = self.seq_no + len(dados)
-
-        pac = make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.n_seq, FLAGS_ACK)
-        pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
-        self.servidor.rede.enviar(pac+dados, self.id_conexao[0])
-
+        self.unsent = self.unsent + dados
+        pront = self.unsent[: (self.window * MSS)]
+        self.unsent = self.unsent[(self.window * MSS) :]
+        self.ult_seq = self.seq_no + len(pront)
+        n_segment = math.ceil(len(pront) / MSS)
+        for i in range(n_segment):
+            segment = pront[i * MSS : (i + 1) * MSS]
+            self.enviar_seg_ack(segment)
 
     def fechar(self):
-        pac = make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.n_seq, FLAGS_FIN)
-        pac = fix_checksum(pac, self.id_conexao[0], self.id_conexao[2])
-        self.servidor.rede.enviar(pac, self.id_conexao[0])
+        ack_segment = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, self.ack_no, FLAGS_FIN)
+        self.servidor.rede.enviar(fix_checksum(ack_segment, self.id_conexao[2], self.id_conexao[0]), self.id_conexao[0])
+        
+    def retrans(self):
+        self.retransm = True
+        tam = min(MSS, len(self.unacked))
+        data = self.unacked[:tam]
+        self.enviar_seg_ack(data)
+
+    def enviar_seg_ack(self, data):
+        seq_no = None
+        if self.retransm:
+            seq_no = self.sendb
+        else:
+            seq_no = self.seq_no
+            self.seq_no = self.seq_no + len(data)
+            self.unacked = self.unacked + data
+            self.temp_ini = time.time()        
+        pac = make_header(self.id_conexao[1], self.id_conexao[3], seq_no, self.ack_no, FLAGS_ACK)
+        ack_segment = fix_checksum(pac + data, self.id_conexao[0], self.id_conexao[2])
+        self.servidor.rede.enviar(ack_segment, self.id_conexao[1])
+        if not self.timer and not self.closing:
+            self.timer_inic() 
+
+    def envio_pendente(self):
+        tam_pendente = (self.window * MSS) - len(self.unacked)
+        if tam_pendente > 0:
+            pront = self.unsent[:tam_pendente]
+            self.unsent = self.unsent[tam_pendente:]
+            self.ult_seq = self.seq_no + len(pront)
+            n_segment = math.ceil(len(pront) / MSS)
+            
+            for i in range(n_segment):
+                segment = pront[i * MSS : (i + 1) * MSS]
+                self.enviar_seg_ack(segment)
+                         
+    def calc_rt(self):
+        self.sample_rtt = self.temp_fin - self.temp_ini
+        if self.iter_inic:
+            self.iter_inic = False
+            self.devr = self.sample_rtt / 2
+            self.estimated_rtt = self.sample_rtt
+        else:
+            self.estimated_rtt = ((0.75) * self.estimated_rtt) + (0.25 * self.sample_rtt)
+            self.devr = ((0.5) * self.devr) + (0.5 * abs(self.sample_rtt - self.estimated_rtt))
+        self.interv = self.estimated_rtt + (4 * self.devr)   
