@@ -80,7 +80,7 @@ class Conexao:
     def timer_limit(self):
         self.timer = None
         self.window = max(self.window // 2, 1)
-        self.retransmitir()
+        self.retrans()
         self.timer_inic()
 
     def timer_inic(self):
